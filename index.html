@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>OSINT Tracker – Live Flights & Ships</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<style>
+:root{--bg:#0b0f14;--panel:#121923;--line:#1f2a38;--tx:#d7e0ea;--mut:#7d8ca0;--acc:#38bdf8}
+*{box-sizing:border-box}html,body{height:100%;margin:0;background:var(--bg);color:var(--tx);font:13px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+#app{display:flex;height:100%}
+#side{width:330px;background:var(--panel);border-right:1px solid var(--line);display:flex;flex-direction:column;min-height:0}
+#map{flex:1;min-width:0;background:#0b0f14}
+h1{font-size:15px;margin:0;padding:12px 14px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:8px}
+.dot{width:9px;height:9px;border-radius:50%;background:#facc15;display:inline-block}.dot.ok{background:#22c55e}.dot.err{background:#ef4444}
+.sec{padding:10px 14px;border-bottom:1px solid var(--line)}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+label{display:flex;align-items:center;gap:5px;cursor:pointer}
+input[type=search]{width:100%;background:#0b121b;border:1px solid var(--line);color:var(--tx);padding:8px;border-radius:6px}
+button{background:#17202c;border:1px solid var(--line);color:var(--tx);padding:5px 9px;border-radius:6px;cursor:pointer}button:hover{border-color:var(--acc)}
+.stats{display:grid;grid-template-columns:1fr 1fr;gap:6px}.stat{background:#0b121b;border:1px solid var(--line);border-radius:6px;padding:6px 8px}
+.stat b{display:block;font-size:17px}.stat span{color:var(--mut);font-size:11px}
+#detail{font-size:12px}#detail h3{margin:0 0 6px;font-size:14px}#detail table{width:100%;border-collapse:collapse}
+#detail td{padding:2px 0;vertical-align:top}#detail td:first-child{color:var(--mut);width:42%}
+#list{flex:1;overflow:auto;min-height:60px}.item{padding:6px 14px;border-bottom:1px solid #161f2b;cursor:pointer;display:flex;justify-content:space-between;gap:8px}
+.item:hover{background:#17202c}.item small{color:var(--mut)}
+#hint{color:#fbbf24;min-height:16px}.foot{padding:8px 14px;color:var(--mut);font-size:11px}.foot a{color:var(--acc)}
+.mk{background:none;border:none}.mk svg{width:22px;height:22px;display:block;filter:drop-shadow(0 0 2px #000)}
+.sel svg{filter:drop-shadow(0 0 5px #fff)}
+@media(max-width:760px){#app{flex-direction:column-reverse}#side{width:100%;height:46%;border-right:0;border-top:1px solid var(--line)}}
+</style>
+</head>
+<body>
+<div id="app">
+ <aside id="side">
+  <h1><span class="dot" id="dot"></span> OSINT Tracker <small style="color:var(--mut);font-weight:400" id="upd">starting…</small></h1>
+  <div class="sec">
+   <div class="row"><label><input type="checkbox" id="tF" checked> ✈ Flights</label><label><input type="checkbox" id="tS" checked> 🚢 Ships</label><label><input type="checkbox" id="tP"> Pause</label></div>
+   <div class="row" style="margin-top:8px" id="presets"></div>
+   <div id="hint" style="margin-top:6px"></div>
+  </div>
+  <div class="sec"><input type="search" id="q" placeholder="Search loaded callsign / reg / hex / ship / MMSI"></div>
+  <div class="sec"><div class="stats" id="stats"></div></div>
+  <div class="sec" id="detail"><span style="color:var(--mut)">Click a marker or list item for details.</span></div>
+  <div id="list"></div>
+  <div class="foot">Aircraft: ADS-B community feeds (adsb.lol, airplanes.live). Ships: Fintraffic Digitraffic AIS (CC BY 4.0), Baltic/N. Europe only. Public data, may be delayed or incomplete.</div>
+ </aside>
+ <div id="map"></div>
+</div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+const $=id=>document.getElementById(id);
+const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const PRESETS={'Helsinki / Baltic':[60.17,24.94,7],'Delhi':[28.56,77.1,8],'Dubai':[25.25,55.36,8],'London':[51.5,-0.2,8],'New York':[40.7,-73.9,8],'Singapore':[1.3,103.9,9]};
+const COVER={n:70,s:53,w:9,e:32}; // approx Digitraffic AIS coverage
+const map=L.map('map',{worldCopyJump:true}).setView([60.17,24.94],7);
+L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png',{attribution:'&copy; OpenStreetMap contributors &copy; CARTO',subdomains:'abcd',maxZoom:18}).addTo(map);
+const flights=new Map(), ships=new Map();
+let sel=null, selLine=L.polyline([],{color:'#38bdf8',weight:2,opacity:.8}).addTo(map), lastF=null, lastS=null, busy=false;
+
+const PLANE='<svg viewBox="0 0 24 24"><path d="M12 1.5l2 7.2 8 4.3v2.2l-8-2.2v5l2.2 2v2l-4.2-1.2-4.2 1.2v-2l2.2-2v-5l-8 2.2V13l8-4.3z"/></svg>';
+const BOAT='<svg viewBox="0 0 24 24"><path d="M12 2l6 18-6-4-6 4z"/></svg>';
+const altColor=a=>a==null?'#94a3b8':a<=0?'#94a3b8':a<5000?'#4ade80':a<20000?'#facc15':a<35000?'#fb923c':'#f472b6';
+function shipColor(t){if(t>=70&&t<80)return'#4ade80';if(t>=80&&t<90)return'#f87171';if(t>=60&&t<70)return'#60a5fa';if(t===30)return'#fbbf24';if(t===31||t===32||t===52)return'#c084fc';if(t===36||t===37)return'#2dd4bf';return'#cbd5e1'}
+function shipKind(t){if(t>=70&&t<80)return'Cargo';if(t>=80&&t<90)return'Tanker';if(t>=60&&t<70)return'Passenger';if(t===30)return'Fishing';if(t===31||t===32||t===52)return'Tug/Tow';if(t===36||t===37)return'Sail/Pleasure';if(t>=40&&t<50)return'High-speed';return'Other/Unknown'}
+const NAV=['Under way (engine)','At anchor','Not under command','Restricted maneuverability','Constrained by draught','Moored','Aground','Fishing','Under way (sailing)'];
+const mkIcon=(svg,color,rot,sel)=>L.divIcon({className:'mk'+(sel?' sel':''),html:`<div style="transform:rotate(${rot}deg);fill:${color}">${svg}</div>`,iconSize:[22,22],iconAnchor:[11,11]});
+const wrap=l=>((l+180)%360+360)%360-180;
+function km(a,b,c,d){const R=6371,r=Math.PI/180,x=Math.sin((c-a)*r/2)**2+Math.cos(a*r)*Math.cos(c*r)*Math.sin((d-b)*r/2)**2;return 2*R*Math.asin(Math.sqrt(x))}
+const age=ts=>{if(!ts)return'?';const s=Math.max(0,(Date.now()-ts)/1000);return s<90?Math.round(s)+'s ago':s<5400?Math.round(s/60)+' min ago':Math.round(s/3600)+' h ago'};
+
+function setStatus(ok,msg){$('dot').className='dot '+(ok?'ok':'err');$('upd').textContent=msg}
+
+function upsertFlight(a){
+  let f=flights.get(a.h);
+  const col=a.mil?'#f43f5e':altColor(a.alt);
+  if(!f){f={d:a,trail:[],m:L.marker([a.la,a.lo],{icon:mkIcon(PLANE,col,a.tr,false),keyboard:false})};
+    f.m.on('click',()=>select('f',a.h));f.m.addTo(map);flights.set(a.h,f)}
+  else{f.d=a;f.m.setLatLng([a.la,a.lo]);const el=f.m.getElement();if(el&&el.firstElementChild){el.firstElementChild.style.transform=`rotate(${a.tr}deg)`;el.firstElementChild.style.fill=col}}
+  const t=f.trail,l=t[t.length-1];if(!l||l[0]!==a.la||l[1]!==a.lo){t.push([a.la,a.lo]);if(t.length>40)t.shift()}
+}
+function upsertShip(s){
+  let o=ships.get(s.m);
+  const rot=s.hd!=null?s.hd:(s.cog||0),col=shipColor(s.st),op=(s.sog||0)<0.5?.55:1;
+  if(!o){o={d:s,m:L.marker([s.la,s.lo],{icon:mkIcon(BOAT,col,rot,false),keyboard:false,opacity:op})};
+    o.m.on('click',()=>select('s',s.m));o.m.addTo(map);ships.set(s.m,o)}
+  else{o.d=s;o.m.setLatLng([s.la,s.lo]);o.m.setOpacity(op);const el=o.m.getElement();if(el&&el.firstElementChild){el.firstElementChild.style.transform=`rotate(${rot}deg)`;el.firstElementChild.style.fill=col}}
+}
+function clearAll(m){for(const v of m.values())v.m.remove();m.clear()}
+function sweep(m,seen){for(const [k,v] of m){if(!seen.has(k)){v.m.remove();m.delete(k)}}}
+
+async function loadFlights(){
+  if(!$('tF').checked){clearAll(flights);return}
+  const c=map.getCenter(),b=map.getBounds();
+  const nm=Math.ceil(km(c.lat,c.lng,b.getNorth(),b.getEast())/1.852);
+  const dist=Math.min(250,Math.max(10,nm));
+  const r=await fetch(`/api/flights?lat=${c.lat.toFixed(3)}&lon=${wrap(c.lng).toFixed(3)}&dist=${dist}`);
+  const j=await r.json();if(!r.ok)throw new Error(j.error||('flights HTTP '+r.status));
+  const seen=new Set();for(const a of j.ac){seen.add(a.h);upsertFlight(a)}sweep(flights,seen);
+  lastF={nm,count:j.count,src:j.source};
+}
+async function loadShips(){
+  if(!$('tS').checked){clearAll(ships);return}
+  const b=map.getBounds();
+  if(b.getSouth()>COVER.n||b.getNorth()<COVER.s||b.getWest()>COVER.e||b.getEast()<COVER.w||map.getZoom()<5){clearAll(ships);lastS={out:true};return}
+  const p=new URLSearchParams({n:Math.min(b.getNorth(),COVER.n).toFixed(3),s:Math.max(b.getSouth(),COVER.s).toFixed(3),e:Math.min(b.getEast(),COVER.e).toFixed(3),w:Math.max(b.getWest(),COVER.w).toFixed(3)});
+  const r=await fetch('/api/ships?'+p);const j=await r.json();if(!r.ok)throw new Error(j.error||('ships HTTP '+r.status));
+  const seen=new Set();for(const s of j.ships){seen.add(s.m);upsertShip(s)}sweep(ships,seen);
+  lastS={count:j.count};
+}
+async function refresh(){
+  if(busy)return;busy=true;
+  const errs=[];
+  await Promise.all([loadFlights().catch(e=>errs.push(e.message)),loadShips().catch(e=>errs.push(e.message))]);
+  const hints=[];
+  if(lastF&&lastF.nm>250&&$('tF').checked)hints.push('Zoom in: aircraft feed covers max 250 nm radius.');
+  if(lastS&&lastS.out&&$('tS').checked)hints.push('Free AIS covers Baltic/N. Europe only (zoom ≥5).');
+  $('hint').textContent=hints.join(' ');
+  if(errs.length)setStatus(false,'error: '+errs[0].slice(0,60));else setStatus(true,'updated '+new Date().toLocaleTimeString());
+  busy=false;render();
+}
+function stats(){
+  const fa=[...flights.values()].map(f=>f.d),sh=[...ships.values()].map(s=>s.d);
+  const air=fa.filter(a=>!a.g),mv=sh.filter(s=>(s.sog||0)>=0.5);
+  const fast=air.reduce((m,a)=>a.gs>(m?m.gs:-1)?a:m,null),mil=fa.filter(a=>a.mil).length;
+  const cell=(v,l)=>`<div class="stat"><b>${v}</b><span>${l}</span></div>`;
+  $('stats').innerHTML=cell(fa.length,'aircraft in view')+cell(air.length,'airborne')+cell(mil,'flagged military')+cell(fast?Math.round(fast.gs)+' kt':'–','fastest'+(fast&&fast.c?' ('+esc(fast.c)+')':''))+cell(sh.length,'vessels')+cell(mv.length,'moving (≥0.5 kt)');
+}
+function render(){
+  stats();
+  const q=$('q').value.trim().toLowerCase(),items=[];
+  if(q){
+    for(const f of flights.values()){const a=f.d;if([a.c,a.r,a.h,a.t].some(x=>x&&x.toLowerCase().includes(q)))items.push({k:'f',id:a.h,t:a.c||a.h.toUpperCase(),s:`${a.t||''} ${a.r||''}`,la:a.la,lo:a.lo})}
+    for(const o of ships.values()){const s=o.d;if([s.n,String(s.m),s.cs,String(s.imo)].some(x=>x&&String(x).toLowerCase().includes(q)))items.push({k:'s',id:s.m,t:s.n||('MMSI '+s.m),s:shipKind(s.st),la:s.la,lo:s.lo})}
+  }
+  $('list').innerHTML=items.slice(0,80).map((i,n)=>`<div class="item" data-n="${n}"><span>${i.k==='f'?'✈':'🚢'} ${esc(i.t)}</span><small>${esc(i.s)}</small></div>`).join('')||(q?'<div class="foot">No match in loaded data.</div>':'');
+  $('list')._items=items;
+  if(sel)showDetail();
+}
+$('list').addEventListener('click',e=>{const it=e.target.closest('.item');if(!it)return;const i=$('list')._items[+it.dataset.n];if(i){map.flyTo([i.la,i.lo],Math.max(map.getZoom(),9));select(i.k,i.id)}});
+$('q').addEventListener('input',render);
+
+function select(k,id){
+  if(sel){const o=(sel.k==='f'?flights:ships).get(sel.id);if(o){const el=o.m.getElement();if(el)el.classList.remove('sel')}}
+  sel={k,id};const o=(k==='f'?flights:ships).get(id);if(o){const el=o.m.getElement();if(el)el.classList.add('sel')}
+  showDetail();
+}
+function showDetail(){
+  const o=(sel.k==='f'?flights:ships).get(sel.id);
+  if(!o){$('detail').innerHTML='<span style="color:var(--mut)">Selected target left the view.</span>';selLine.setLatLngs([]);return}
+  const rows=[];
+  if(sel.k==='f'){const a=o.d;
+    rows.push(['Callsign',a.c||'–'],['ICAO hex',a.h.toUpperCase()],['Registration',a.r||'–'],['Type',a.t||'–'],
+      ['Altitude',a.g?'On ground':a.alt==null?'–':a.alt.toLocaleString()+' ft'],['Ground speed',a.gs==null?'–':Math.round(a.gs)+' kt ('+Math.round(a.gs*1.852)+' km/h)'],
+      ['Track',Math.round(a.tr)+'°'],['Vertical rate',a.vr==null?'–':a.vr+' ft/min'],['Squawk',a.sq||'–'],['Position',a.la.toFixed(4)+', '+a.lo.toFixed(4)]);
+    if(['7500','7600','7700'].includes(a.sq))rows.push(['⚠ Squawk',{'7500':'Hijack','7600':'Radio failure','7700':'Emergency'}[a.sq]]);
+    $('detail').innerHTML=`<h3>✈ ${esc(a.c||a.h.toUpperCase())}${a.mil?' <small style="color:#f43f5e">military flag</small>':''}</h3>`+tbl(rows);
+    selLine.setLatLngs(o.trail);
+  }else{const s=o.d;
+    rows.push(['Name',s.n||'–'],['MMSI',s.m],['IMO',s.imo||'–'],['Call sign',s.cs||'–'],['Type',shipKind(s.st)],['Status',NAV[s.ns]||'–'],
+      ['Speed',s.sog==null?'–':s.sog.toFixed(1)+' kt'],['Course',s.cog==null?'–':Math.round(s.cog)+'°'],['Heading',s.hd==null?'–':s.hd+'°'],['Destination',s.d||'–'],
+      ['Last report',age(s.ts)],['Position',s.la.toFixed(4)+', '+s.lo.toFixed(4)]);
+    $('detail').innerHTML=`<h3>🚢 ${esc(s.n||'MMSI '+s.m)}</h3>`+tbl(rows);selLine.setLatLngs([]);
+  }
+}
+const tbl=r=>'<table>'+r.map(x=>`<tr><td>${esc(x[0])}</td><td>${esc(x[1])}</td></tr>`).join('')+'</table>';
+
+for(const [name,[la,lo,z]] of Object.entries(PRESETS)){const b=document.createElement('button');b.textContent=name;b.onclick=()=>map.flyTo([la,lo],z,{duration:1.2});$('presets').appendChild(b)}
+let deb;map.on('moveend',()=>{clearTimeout(deb);deb=setTimeout(()=>{if(!$('tP').checked)refresh()},700)});
+$('tF').onchange=$('tS').onchange=()=>refresh();
+setInterval(()=>{if(!$('tP').checked&&!document.hidden)refresh()},15000);
+document.addEventListener('visibilitychange',()=>{if(!document.hidden&&!$('tP').checked)refresh()});
+refresh();
+</script>
+</body>
+</html>
